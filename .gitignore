@@ -1,62 +1,53 @@
-# UrbanPulse-DADIS-compatible — repo root .gitignore
-
-# --- Python ---
+# Python
 __pycache__/
 *.py[cod]
-*.so
 .venv/
 venv/
-env/
-ENV/
-.pytest_cache/
-.mypy_cache/
+*.egg-info/
 
-# --- Node ---
+# Node
 node_modules/
-fleetbus/node_modules/
+dist/
+.vite/
+.env.local
+.env.*.local
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
 
-# --- Build output ---
-dist/
-build/
-fleetbus/dist/
-fleetbus/build/
+# Data & evidence
+backend/data/*.sqlite3*
+backend/edge/data/*.sqlite3*
+backend/results/evidence/*
+public/evidence/*
+!backend/results/evidence/.gitkeep
 
-# --- Runtime data (regenerated, not source) ---
-*.db
-*.sqlite
-*.sqlite3
-fleetbus/backend/data/
-fleetbus/backend/results/
-fleetbus/backend/videos/uploads/
-fleetbus/backend/uploads/
-.sites-runtime/
+# Backups & junk
+upgrade-backup-*/
+frontend-before-restore-*/
+fleetbus/
+*.bak
+*.backup
+PACKAGE_SHA256.json
 
-# --- Model weights ---
-# Pretrained COCO checkpoint — re-downloadable, do not commit
-fleetbus/backend/models/yolov8n.pt
+# Internal tools (not needed by judges)
+create_copy.py
+setup-windows.ps1
+start-demo.ps1
+
+# Videos (keep demo originals, exclude huge)
+*.uploading
+*.original.mp4
+
+# Models (exclude ONNX - too big)
 *.onnx
-*.weights
 
-# --- IDE / OS ---
-.vscode/
-.idea/
-*.swp
-*.swo
+# OS
 .DS_Store
 Thumbs.db
 
-# --- Secrets ---
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-secrets.json
+# IDE
+.vscode/
+.idea/
 
-# --- Misc ---
-*.bak
-*.tmp
+# Logs
+*.log
