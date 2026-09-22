@@ -1,0 +1,37 @@
+{
+  "gps": {
+    "mode": "simulated",
+    "path": "data/current_gps.json",
+    "max_age_seconds": 15,
+    "max_accuracy_m": 50
+  },
+  "road_dedup_radius_m": 15,
+  "road_dedup_seconds": 86400,
+  "congestion_radius_m": 30,
+  "congestion_location_cooldown_seconds": 120,
+  "pothole_shading": true,
+  "track_trails": true,
+  "traffic_tracker": "bytetrack.yaml",
+  "road_event_classes": [
+    "pothole",
+    "crack",
+    "longitudinal_crack",
+    "transverse_crack",
+    "alligator_crack"
+  ],
+  "road_inference": {},
+  "traffic_inference": {},
+  "school_context": {
+    "enabled": false,
+    "radius_m": 150
+  },
+  "violations": {
+    "enabled": false,
+    "camera_mode": "moving",
+    "video_sha256": null,
+    "stop_line": null,
+    "signal_roi": null,
+    "approach_side": -1,
+    "red_hold_seconds": 0.5
+  }
+}

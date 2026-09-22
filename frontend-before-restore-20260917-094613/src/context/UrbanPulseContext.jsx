@@ -1,0 +1,780 @@
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import { CHENNAI_FLEET } from '../data/busesData';
+import { INITIAL_ALL_DETECTIONS } from '../data/detectionsData';
+import { DEPARTMENTS } from '../data/departmentsData';
+import { updateBusCoordinate } from '../utils/geoUtils';
+import { getAutoAssignedDepartment, generateReportId } from '../utils/workflowEngine';
+
+import { CENTRAL_URL, EDGE_URL, readJson, eventToDetection } from '../services/edgeApi';
+
+const UrbanPulseContext = createContext(null);
+
+// Calculate approximate distance between two GPS coordinates in meters
+function distanceInMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+
+  const toRadians = degrees => degrees * Math.PI / 180;
+
+  const dLat = toRadians(lat2 - lat1);
+  const dLng = toRadians(lng2 - lng1);
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRadians(lat1)) *
+    Math.cos(toRadians(lat2)) *
+    Math.sin(dLng / 2) ** 2;
+
+  const c =
+    2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c;
+}
+
+export function UrbanPulseProvider({ children }) {
+  const [buses, setBuses] = useState([]);
+  const [detections, setDetections] = useState([]);
+  const [departments, setDepartments] = useState(DEPARTMENTS);
+  const [simulationRunning, setSimulationRunning] = useState(false);
+  const [selectedReport, setSelectedReport] = useState(null);
+  const [selectedBus, setSelectedBus] = useState(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [isNotificationOpen, setIsNotificationOpen] = useState(false);
+  const [activeRoute, setActiveRoute] = useState('dashboard');
+  const [activeFilter, setActiveFilter] = useState('ALL');
+
+  // Real-time notification queue
+  const [notifications, setNotifications] = useState([]);
+  const [edgeStatus, setEdgeStatus] = useState(null);
+  const [edgeConnected, setEdgeConnected] = useState(false);
+
+  const [centralConnection, setCentralConnection] = useState('connecting');
+  const eventCursor = useRef(0);
+  const seenEdgeEvents = useRef(new Set());
+
+  // Central events are already deduplicated and geolocated at the edge.
+  // Do not pass them through the legacy random-bus/fallback-confidence builder.
+  useEffect(() => {
+    let cancelled = false, timer;
+    async function pollEvents() {
+      try {
+        const page = await readJson(`${CENTRAL_URL}/api/events?after=${eventCursor.current}&limit=200`);
+        if (cancelled) return;
+        const fresh = page.events.filter(e => ['ROAD_OBSERVATION', 'TRAFFIC_CONGESTION'].includes(e.event_type) && ['PRERECORDED_VIDEO_AI', 'CAMERA_AI'].includes(e.source) && !seenEdgeEvents.current.has(e.event_id));
+        fresh.forEach(e => seenEdgeEvents.current.add(e.event_id));
+        eventCursor.current = page.next_cursor;
+        if (fresh.length) {
+          const records = fresh.map(eventToDetection).reverse();
+          setDetections(prev => [...records, ...prev]);
+          setNotifications(prev => [...records.map(d => ({
+            id: `edge-${d.id}`, reportId: d.id, title: d.title,
+            message: `${d.busId} / ${d.cameraId} · ${d.timestamp} · ${d.location}` +
+              (d.vehicleCount != null ? ` · Vehicles: ${d.vehicleCount}` : '') +
+              (d.trackId != null ? ` · Track #${d.trackId}` : ''),
+            category: d.severity === 'CRITICAL' ? 'CRITICAL' : 'WARNING',
+            time: new Date(d.timestamp).toLocaleTimeString(), timestamp: Date.parse(d.timestamp), unread: true,
+          })), ...prev]);
+        }
+        setCentralConnection('connected');
+        if (!cancelled) timer = setTimeout(pollEvents, page.events.length === 200 ? 50 : 1500);
+      } catch {
+        if (!cancelled) { setCentralConnection('offline'); timer = setTimeout(pollEvents, 3000); }
+      }
+    }
+    pollEvents();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, []);
+
+  // Local demo telemetry: no camera frames are sent to the central service.
+  useEffect(() => {
+    let stopped = false, timer;
+    const markStale = () => setBuses(prev => prev.map(bus => bus.edgeGps ? { ...bus, gpsStale: true } : bus));
+    async function pollGPS() {
+      try {
+        const status = await readJson(`${EDGE_URL}/api/status`);
+        if (stopped) return;
+        // The first integration version omitted the validity flag for its simulated route.
+        if (status.gps && status.gps.valid === undefined) {
+          status.gps.valid = Number.isFinite(status.gps.latitude) && Number.isFinite(status.gps.longitude)
+            && Math.abs(status.gps.latitude) <= 90 && Math.abs(status.gps.longitude) <= 180;
+        }
+        setEdgeStatus(status); setEdgeConnected(true);
+        if (status.gps?.valid) {
+          const fix = status.gps;
+          setBuses([{ id: status.bus_id, lat: fix.latitude, lng: fix.longitude,
+            edgeGps: true, gpsStale: false, gpsSource: fix.source,
+            gpsUpdatedAt: new Date().toISOString(), heading: 0, speed: 0,
+            route: fix.source === 'SIMULATED_ROUTE' ? 'Simulated prototype route' : 'External GPS',
+            currentLocation: fix.source === 'SIMULATED_ROUTE' ? 'Prototype GPS route' : 'External GPS fix',
+          }]);
+        } else markStale();
+      } catch { if (!stopped) { setEdgeConnected(false); markStale(); } }
+      if (!stopped) timer = setTimeout(pollGPS, 1500);
+    }
+    pollGPS();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, []);
+
+  // Derived category lists
+  const potholes = detections.filter(d => d.type === 'pothole' || d.type === 'road_damage');
+  const waterlogging = detections.filter(d => d.type === 'waterlogging');
+  const trafficSignals = detections.filter(d => d.type === 'damaged_signal' || d.type === 'damaged_signboard' || d.type === 'missing_zebra_crossing');
+  const schoolViolations = detections.filter(d => d.type === 'school_zone_violation');
+  const incidents = detections.filter(d => ['hit_and_run', 'rash_driving', 'dangerous_overtaking', 'pedestrian_risk', 'traffic_congestion', 'school_zone_pedestrian', 'red_light_violation', 'wrong_way_driving'].includes(d.type));
+
+  // Add a new detection from Live Camera / Edge AI
+const addNewDetection = (customData = {}) => {
+  const type = customData.type || 'pothole';
+  const deptInfo = getAutoAssignedDepartment(type);
+
+  const selectedBus =
+    customData.busId
+      ? buses.find(bus => bus.id === customData.busId)
+      : null;
+
+  const randomBus =
+    selectedBus ||
+    buses[Math.floor(Math.random() * buses.length)];
+
+  const now = new Date();
+  const timeStr = now.toTimeString().split(' ')[0];
+  const dateStr = now.toISOString().split('T')[0];
+
+  const confidence =
+    typeof customData.confidence === 'number'
+      ? customData.confidence
+      : 0.92;
+
+  const severity =
+    customData.severity ||
+    (confidence >= 0.90 ? 'CRITICAL' : 'HIGH');
+
+  const lat =
+    customData.lat ??
+    randomBus?.lat ??
+    12.9016;
+
+  const lng =
+    customData.lng ??
+    randomBus?.lng ??
+    80.2279;
+
+  /*
+   * ---------------------------------------------------------
+   * DUPLICATE / SAME-LOCATION INCIDENT DETECTION
+   * ---------------------------------------------------------
+   *
+   * If the same type of road problem is already within
+   * approximately 50 meters, treat this as another
+   * observation of the same incident.
+   */
+
+  const existingIncident = detections.find(item => {
+  if (item.type !== type) return false;
+
+  /*
+   * IMPORTANT:
+   * Only cluster against incidents that were created
+   * by the live AI pipeline.
+   *
+   * This prevents an old/static demo record from
+   * swallowing a brand-new YOLO incident and preventing
+   * its notification.
+   */
+
+  const source = item.detectionSource || '';
+
+  const isLiveAiIncident =
+    source === 'LIVE_AI' ||
+    source === 'UPLOADED_VIDEO_AI' ||
+    source === 'WEBCAM_AI';
+
+  if (!isLiveAiIncident) {
+    return false;
+  }
+
+  if (
+    typeof item.lat !== 'number' ||
+    typeof item.lng !== 'number'
+  ) {
+    return false;
+  }
+
+  const distance = distanceInMeters(
+    lat,
+    lng,
+    item.lat,
+    item.lng
+  );
+
+  return distance <= 50;
+});
+
+  // ---------------------------------------------------------
+  // EXISTING INCIDENT FOUND
+  // ---------------------------------------------------------
+
+  if (existingIncident) {
+    const observation = {
+      id: `obs-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 7)}`,
+
+      busId:
+        customData.busId ||
+        randomBus?.id ||
+        'UNKNOWN-BUS',
+
+      cameraId:
+        customData.cameraId ||
+        'FRONT-CAM-01',
+
+      confidence,
+
+      detectionSource:
+        customData.detectionSource ||
+        'LIVE_AI',
+
+      evidenceImg:
+        customData.evidenceImg ||
+        null,
+
+      boundingBox:
+        customData.boundingBox ||
+        null,
+
+      detectedAt:
+        customData.detectedAt ||
+        now.toISOString(),
+
+      timestamp:
+        `${dateStr} ${timeStr}`
+    };
+
+    let updatedIncident = null;
+
+    setDetections(prev =>
+      prev.map(item => {
+        if (item.id !== existingIncident.id) {
+          return item;
+        }
+
+        const observations = [
+          ...(item.observations || []),
+          observation
+        ];
+
+        const highestConfidence = Math.max(
+          item.confidence || 0,
+          confidence
+        );
+
+        updatedIncident = {
+          ...item,
+
+          // Keep one incident ID
+          id: item.id,
+
+          // Increase number of independent observations
+          observationCount: observations.length,
+
+          observations,
+
+          // Keep strongest AI confidence
+          confidence: highestConfidence,
+
+          // Remember latest detection
+          lastDetectedAt:
+            customData.detectedAt ||
+            now.toISOString(),
+
+          lastDetectedBy:
+            customData.busId ||
+            randomBus?.id ||
+            'UNKNOWN-BUS',
+
+          // Evidence can be updated with newer/better evidence
+          evidenceImg:
+            customData.evidenceImg ||
+            item.evidenceImg,
+
+          // Make the incident stronger when repeatedly confirmed
+          severity:
+            item.severity === 'CRITICAL' ||
+            severity === 'CRITICAL'
+              ? 'CRITICAL'
+              : item.severity,
+
+          statusHistory: [
+            ...(item.statusHistory || []),
+            {
+              status: item.status,
+              time: `${dateStr} ${timeStr}`,
+              note:
+                `Additional AI observation received from ${
+                  customData.busId ||
+                  randomBus?.id ||
+                  'road camera'
+                }`
+            }
+          ]
+        };
+
+        return updatedIncident;
+      })
+    );
+
+    /*
+     * IMPORTANT:
+     * Do NOT create another notification.
+     *
+     * The existing incident already generated an alert.
+     * Repeated observations are simply attached to it.
+     */
+
+    return updatedIncident || existingIncident;
+  }
+
+  // ---------------------------------------------------------
+  // NEW INCIDENT
+  // ---------------------------------------------------------
+
+  const newId =
+    customData.id ||
+    generateReportId(type);
+
+  const newDetection = {
+    id: newId,
+
+    type,
+
+    title:
+      customData.title ||
+      `Live AI Detected: ${type
+        .replace(/_/g, ' ')
+        .toUpperCase()}`,
+
+    location:
+      customData.location ||
+      randomBus?.currentLocation ||
+      'Live Road Monitoring',
+
+    area:
+      customData.area ||
+      'OMR Corridor',
+
+    lat,
+    lng,
+
+    severity,
+
+    confidence,
+
+    detectionSource:
+      customData.detectionSource ||
+      'LIVE_AI',
+
+    boundingBox:
+      customData.boundingBox ||
+      null,
+
+    detectedAt:
+      customData.detectedAt ||
+      now.toISOString(),
+
+    lastDetectedAt:
+      customData.detectedAt ||
+      now.toISOString(),
+
+    busId:
+      customData.busId ||
+      randomBus?.id ||
+      'UNKNOWN-BUS',
+
+    cameraId:
+      customData.cameraId ||
+      'FRONT-CAM-01',
+
+    timestamp:
+      customData.timestamp ||
+      `${dateStr} ${timeStr}`,
+
+    timeAgo: 'Just now',
+
+    department:
+      customData.department ||
+      deptInfo.department,
+
+    division:
+      customData.division ||
+      deptInfo.division,
+
+    deptId:
+      customData.deptId ||
+      deptInfo.deptId,
+
+    assignedOfficer:
+      customData.assignedOfficer ||
+      deptInfo.officer,
+
+    // IMPORTANT:
+    // New incidents begin at DETECTED.
+    status:
+      customData.status ||
+      'DETECTED',
+
+    statusHistory: [
+      {
+        status: 'DETECTED',
+        time: `${dateStr} ${timeStr}`,
+        note:
+          customData.detectionSource === 'LIVE_AI'
+            ? `YOLO AI detected ${type.replace(/_/g, ' ')} from live camera`
+            : 'AI Edge inference tagged live detection'
+      }
+    ],
+
+    // First observation
+    observationCount: 1,
+
+    observations: [
+      {
+        id: `obs-${Date.now()}`,
+
+        busId:
+          customData.busId ||
+          randomBus?.id ||
+          'UNKNOWN-BUS',
+
+        cameraId:
+          customData.cameraId ||
+          'FRONT-CAM-01',
+
+        confidence,
+
+        detectionSource:
+          customData.detectionSource ||
+          'LIVE_AI',
+
+        evidenceImg:
+          customData.evidenceImg ||
+          null,
+
+        boundingBox:
+          customData.boundingBox ||
+          null,
+
+        detectedAt:
+          customData.detectedAt ||
+          now.toISOString(),
+
+        timestamp:
+          `${dateStr} ${timeStr}`
+      }
+    ],
+
+    evidenceImg:
+      customData.evidenceImg ||
+      null,
+
+    evidenceCaptured:
+      Boolean(customData.evidenceImg),
+
+    ...customData
+  };
+
+  // Add the new incident
+  setDetections(prev => [
+    newDetection,
+    ...prev
+  ]);
+
+  // ---------------------------------------------------------
+// ONLY NEW INCIDENTS CREATE NOTIFICATIONS
+// ---------------------------------------------------------
+
+const newNotif = {
+  id:
+    `notif-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 7)}`,
+
+  title:
+    `LIVE AI: ${type
+      .replace(/_/g, ' ')
+      .toUpperCase()} DETECTED`,
+
+  message:
+    `${newDetection.busId} / ${newDetection.cameraId} detected ` +
+    `${type.replace(/_/g, ' ')} with ` +
+    `${Math.round(confidence * 100)}% confidence. ` +
+    `Incident ${newId} created and assigned to ` +
+    `${newDetection.department}.`,
+
+  category:
+    severity === 'CRITICAL' ||
+    severity === 'EMERGENCY'
+      ? 'CRITICAL'
+      : 'WARNING',
+
+  time: 'Just now',
+
+  timestamp: Date.now(),
+
+  unread: true,
+
+  reportId: newId
+};
+
+console.log(
+  'LIVE AI → NEW INCIDENT → NOTIFICATION',
+  {
+    type,
+    confidence,
+    incidentId: newId,
+    busId: newDetection.busId,
+    cameraId: newDetection.cameraId,
+    notification: newNotif
+  }
+);
+
+setNotifications(prev => [
+  newNotif,
+  ...prev
+]);
+
+return newDetection;
+};
+
+// ---------------------------------------------------------
+// STRICT INCIDENT WORKFLOW
+// ---------------------------------------------------------
+
+const WORKFLOW_TRANSITIONS = {
+  DETECTED: 'VERIFIED',
+  VERIFIED: 'ASSIGNED',
+  ASSIGNED: 'IN PROGRESS',
+  'IN PROGRESS': 'RESOLVED',
+  RESOLVED: 'VERIFIED CLOSED'
+};
+
+const updateReportStatus = async (
+  reportId,
+  newStatus,
+  note = '',
+  assignedDept = null
+) => {
+  const edgeRecord = detections.find(d => d.id === reportId && d.edgeEvent);
+  if (edgeRecord) {
+    try {
+      const event = await readJson(`${CENTRAL_URL}/api/events/${reportId}/status`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: newStatus, note, department: assignedDept }),
+      });
+      const updated = eventToDetection(event);
+      setDetections(prev => prev.map(d => d.id === reportId ? updated : d));
+      setSelectedReport(prev => prev?.id === reportId ? updated : prev);
+      return true;
+    } catch (error) {
+      window.alert(`Status was not saved: ${error.message}`);
+      return false;
+    }
+  }
+
+  const now = new Date();
+
+  const timeStr =
+    now.toTimeString().split(' ')[0];
+
+  const dateStr =
+    now.toISOString().split('T')[0];
+
+  let transitionAccepted = false;
+  let updatedIncident = null;
+
+  setDetections(prev =>
+    prev.map(item => {
+      if (item.id !== reportId) {
+        return item;
+      }
+
+      const currentStatus =
+        item.status || 'DETECTED';
+
+      const expectedNextStatus =
+        WORKFLOW_TRANSITIONS[currentStatus];
+
+      // ---------------------------------------------------
+      // STRICT WORKFLOW TRANSITION
+      // ---------------------------------------------------
+
+      if (newStatus !== expectedNextStatus) {
+        console.warn(
+          `Invalid workflow transition: ${currentStatus} → ${newStatus}`
+        );
+
+        return item;
+      }
+
+      transitionAccepted = true;
+
+      const updatedHistory = [
+        ...(item.statusHistory || []),
+        {
+          status: newStatus,
+          time: `${dateStr} ${timeStr}`,
+          note:
+            note ||
+            `Incident moved from ${currentStatus} to ${newStatus}`
+        }
+      ];
+
+      updatedIncident = {
+        ...item,
+
+        status: newStatus,
+
+        statusHistory: updatedHistory
+      };
+
+      // ---------------------------------------------------
+      // DEPARTMENT ASSIGNMENT
+      // ---------------------------------------------------
+
+      if (assignedDept) {
+        updatedIncident.department =
+          assignedDept.department ||
+          item.department;
+
+        updatedIncident.division =
+          assignedDept.division ||
+          item.division;
+
+        updatedIncident.deptId =
+          assignedDept.deptId ||
+          item.deptId;
+      }
+
+      // ---------------------------------------------------
+      // RESOLUTION DATA
+      // ---------------------------------------------------
+
+      if (newStatus === 'RESOLVED') {
+        updatedIncident.resolutionDate =
+          `${dateStr} ${timeStr}`;
+
+        updatedIncident.resolvedBy =
+          item.department ||
+          'Field Action Team';
+
+        updatedIncident.resolutionNote =
+          note ||
+          'Issue rectified by field team.';
+      }
+
+      // ---------------------------------------------------
+      // FINAL VERIFICATION
+      // ---------------------------------------------------
+
+      if (newStatus === 'VERIFIED CLOSED') {
+        updatedIncident.closedDate =
+          `${dateStr} ${timeStr}`;
+
+        updatedIncident.closedBy =
+          item.department ||
+          'Verification Team';
+
+        updatedIncident.closureNote =
+          note ||
+          'Subsequent road observation verified that the issue has been resolved.';
+
+        updatedIncident.resolutionDate =
+          item.resolutionDate ||
+          `${dateStr} ${timeStr}`;
+
+        updatedIncident.resolutionNote =
+          item.resolutionNote ||
+          'Issue rectified and verified.';
+      }
+
+      // ---------------------------------------------------
+      // UPDATE SELECTED REPORT
+      // ---------------------------------------------------
+
+      if (
+        selectedReport &&
+        selectedReport.id === reportId
+      ) {
+        setSelectedReport(updatedIncident);
+      }
+
+      return updatedIncident;
+    })
+  );
+
+  // IMPORTANT:
+  // Status changes do NOT create notifications.
+  //
+  // Notifications are created only when a NEW detection
+  // becomes a NEW incident inside addNewDetection().
+  //
+  // This prevents:
+  // DETECTED → VERIFIED
+  // VERIFIED → ASSIGNED
+  // ASSIGNED → IN PROGRESS
+  // etc.
+  // from flooding the notification panel.
+
+  return transitionAccepted;
+};
+
+  const markAllNotificationsRead = () => {
+    setNotifications(prev => prev.map(n => ({ ...n, unread: false })));
+  };
+
+  const unreadNotifCount = notifications.filter(n => n.unread).length;
+
+  return (
+    <UrbanPulseContext.Provider
+      value={{
+        centralConnection, edgeStatus, edgeConnected,
+        buses,
+        detections,
+        potholes,
+        waterlogging,
+        trafficSignals,
+        schoolViolations,
+        incidents,
+        departments,
+        notifications,
+        unreadNotifCount,
+        simulationRunning,
+        setSimulationRunning,
+        selectedReport,
+        setSelectedReport,
+        selectedBus,
+        setSelectedBus,
+        isSearchOpen,
+        setIsSearchOpen,
+        isNotificationOpen,
+        setIsNotificationOpen,
+        activeRoute,
+        setActiveRoute,
+        activeFilter,
+        setActiveFilter,
+        addNewDetection,
+        updateReportStatus,
+        markAllNotificationsRead
+      }}
+    >
+      {children}
+    </UrbanPulseContext.Provider>
+  );
+}
+
+export function useUrbanPulse() {
+  const context = useContext(UrbanPulseContext);
+  if (!context) {
+    throw new Error('useUrbanPulse must be used within an UrbanPulseProvider');
+  }
+  return context;
+}

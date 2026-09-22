@@ -1,0 +1,12 @@
+[
+  "backend/check_demo.py",
+  "src/App.jsx",
+  "src/components/camera/EdgeCameraPanels.jsx",
+  "src/components/common/Header.jsx",
+  "src/components/common/NotificationDrawer.jsx",
+  "src/components/common/Sidebar.jsx",
+  "src/components/map/GISMap.jsx",
+  "src/context/UrbanPulseContext.jsx",
+  "src/pages/CoreWorkspace.jsx",
+  "src/utils/mapEvents.js"
+]
